@@ -1,0 +1,180 @@
+package main
+
+import (
+	"encoding/json"
+	"github.com/pkg/errors"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"log"
+	"net/http"
+	"strings"
+)
+
+type NodeRec struct {
+	NodeName string
+	NodeIp   string
+}
+
+type NodeList struct {
+	NodeInfo []NodeRec
+	count    int
+	status   string
+}
+
+func (this NodeList) convertToText() string {
+	var ipList strings.Builder
+	for _, rec := range this.NodeInfo {
+		ipList.WriteString(rec.NodeIp)
+		ipList.WriteString("\n")
+	}
+	return ipList.String()
+}
+func getLableSelector(roleFilters []string, labelFilters []string) (bool, string) {
+	var labelSelector strings.Builder
+	var isMinion bool
+	for _, filter := range roleFilters {
+		if filter == "minion" {
+			isMinion = true
+			continue
+		}
+		// role=master
+		// role=CE-245,downforweave
+		// reverse enginner https://github.com/kubernetes/apimachinery/blob/master/pkg/labels/selector.go#L268
+		// for https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#set-based-requirement
+		labelSelector.WriteString("node-role.kubernetes.io/" + filter + " in (true,)")
+		labelSelector.WriteString(",")
+	}
+	for _, filter := range labelFilters {
+		// label=eventfilter%3Dtrue,kafka%3Dtrue  ==>  labelFilters["eventfilter=true","kafka=true"]
+		kv := strings.SplitN(filter, "=", 2)
+		if len(kv) == 2 {
+			labelSelector.WriteString(filter + ",")
+		} else if len(kv) == 1 {
+			labelSelector.WriteString(filter)
+			labelSelector.WriteString(",")
+		}
+	}
+	return isMinion, strings.TrimSuffix(labelSelector.String(), ",")
+}
+
+func getNodesInfo(clientset kubernetes.Interface, roleFilters []string, labelFilters []string) (NodeList, error) {
+	var err error
+	var nodes *v1.NodeList
+	var nodeList NodeList
+	var labelselector string
+	var isMinion bool
+
+	isMinion, labelselector = getLableSelector(roleFilters, labelFilters)
+	log.Printf("The label selector %v , rolefilter %v and labelfilter %v values are: ", labelselector, roleFilters, labelFilters)
+	nodes, err = clientset.CoreV1().Nodes().List(metav1.ListOptions{LabelSelector: labelselector})
+	if err != nil {
+		return nodeList, errors.Wrap(err, "Unreachable KubeApi Server")
+	}
+	if nodes == nil || len(nodes.Items) == 0 {
+		log.Printf("Empty node list")
+	}
+
+	for _, node := range nodes.Items {
+		var hostname, nodeIP string
+		if isMinion {
+			if _, ok := node.ObjectMeta.Labels["node-role.kubernetes.io/master"]; ok {
+				continue
+			}
+		}
+		for _, item := range node.Status.Addresses {
+			if item.Type == v1.NodeInternalIP {
+				nodeIP = item.Address
+			}
+			if item.Type == v1.NodeHostName {
+				hostname = item.Address
+			}
+		}
+		nodeList.NodeInfo = append(nodeList.NodeInfo, NodeRec{NodeName: hostname, NodeIp: nodeIP})
+		log.Printf("the node names are %v", node.Name)
+
+	}
+	nodeList.count = len(nodeList.NodeInfo)
+	nodeList.status = "ok"
+	return nodeList, nil
+}
+
+var clientset kubernetes.Interface
+
+func main() {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+	// creates the clientset
+	clientset, err = kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	log.Println("Starting the application...")
+	http.HandleFunc("/", clientHandler)
+	http.HandleFunc("/nodeInfo", nodeInfoHandler(clientset))
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func clientHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode("I am alive")
+}
+
+func nodeInfoHandler(clientset kubernetes.Interface) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// now you can reference clientset
+		paramsRoles := make([]string, 0)
+		paramsLabels := make([]string, 0)
+		formatType := "json"
+		if len(r.URL.Query()) > 0 {
+		        flag := false
+			flag, paramsRoles = getQueryValue("roles", r)
+			flag, paramsLabels = getQueryValue("labels", r)
+			flag, fparams := getQueryValue("format", r)
+			if flag {
+				if fparams[0] == "json" {
+					formatType = "json"
+				} else if fparams[0] == "text" {
+					formatType = "text"
+				}
+			}
+		}
+		data, err := getNodesInfo(clientset, paramsRoles, paramsLabels)
+		if err != nil {
+			log.Print(err)
+			result, _ := json.Marshal(NodeList{status: "error"})
+			w.Write(result)
+			return
+		}
+		var result []byte
+		if formatType == "json" {
+			result, err = json.Marshal(data)
+			if err != nil {
+				log.Print(err)
+				result, _ := json.Marshal(NodeList{status: "error"})
+				w.Write(result)
+				return
+			}
+			w.Header().Add("Content-Type", "application/json")
+		} else if formatType == "text" {
+			result = []byte(data.convertToText())
+			w.Header().Add("Content-Type", "application/text")
+		}
+		log.Println("Successfully returned data")
+		w.Write(result)
+	}
+}
+
+func getQueryValue(key string, r *http.Request) (bool, []string) {
+	var params []string
+	value, ok := r.URL.Query()[key]
+	if !ok || len(value) != 1 {
+		log.Printf("Url Param is missing a Value with Key:  %v", key)
+		return false, params
+	}
+	params = strings.Split(value[0], ",")
+	return true, params
+}
