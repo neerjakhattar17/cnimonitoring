@@ -1,0 +1,17 @@
+FROM golang:1.11.13-alpine3.10 AS build-env
+RUN apk add --no-cache git gcc musl-dev
+RUN apk update && apk add ca-certificates curl
+RUN mkdir -p  /src/client
+RUN mkdir -p  /src/utils
+COPY utils /src/utils
+COPY client /src/client
+COPY go.mod /src/
+COPY go.sum /src/
+RUN cd /src/ && go mod download && cd /src/client && go build -o client
+
+# final stage
+FROM alpine
+RUN mkdir /app
+WORKDIR /app
+COPY --from=build-env /src/client/client /app/
+CMD ["/app/client"]
