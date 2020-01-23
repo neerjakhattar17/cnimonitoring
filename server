@@ -1,0 +1,282 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
+	//"k8s.io/client-go/kubernetes/typed/core/v1"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.pan.local/kubernetes/cni-monitoring/utils"
+	v1 "k8s.io/api/core/v1"
+)
+
+var (
+	cniWebServerNetWorking = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "KUBE_CNI_MON_WEBSERVER_NETWORKING_WORKING",
+		Help: "1 is working and 0 is non working."},
+		[]string{"errMsg"})
+	cniWebServerNetWorkingUP = prometheus.NewGauge(prometheus.GaugeOpts{Name: "KUBE_CNI_MON_WEBSERVER_NETWORKING_WORKING_UP",
+		Help: "1 is working and 0 is non working."})
+	cniClientNetWorking = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "KUBE_CNI_CLIENT_NETWORKING_WORKING",
+		Help: "1 is working and 0 is non working."},
+		[]string{"hostnames", "errMsg"})
+	cniClientNetWorkingUP = prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "KUBE_CNI_CLIENT_NETWORKING_WORKING_UP",
+		Help: "1 is working and 0 is non working."},
+		[]string{"hostname"})
+	daemonSetPodsData     map[string]string
+	daemonSetPodsDataLock = sync.Mutex{}
+
+	aggregatedClientData     map[string]utils.Status
+	aggregatedClientDataLock = sync.Mutex{}
+
+	errKubeAPIUnReachable    = errors.New("kube_api_unreachable")
+	errMissingPods           = errors.New("missing_pods")
+	errUnabletoMarhshallJSON = errors.New("unable_to_marshall_json")
+	errMissingNodes          = errors.New("missing_nods")
+)
+
+func main() {
+	prometheus.MustRegister(cniWebServerNetWorking)
+	prometheus.MustRegister(cniWebServerNetWorkingUP)
+	prometheus.MustRegister(cniClientNetWorkingUP)
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+	// creates the clientset
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	log.Println("INFO Successfuly fetched kube config")
+	namespace := utils.GetEnv("CNI_MON_NAMESPACE", "kube-system")
+	labelselector := utils.GetEnv("CNI_MON_LABELSELECTOR", "app=cni-monitoring-daemonset")
+	aggregatedClientData = make(map[string]utils.Status)
+	ticker := time.NewTicker(7 * time.Minute)
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	var gracefulStop = make(chan os.Signal)
+	signal.Notify(gracefulStop, syscall.SIGTERM)
+	go func() {
+		sig := <-gracefulStop
+		log.Printf("Caught sig: %+v", sig)
+		cancel()
+	}()
+	go getDaemonSetFromKubeAPIServer(clientset, namespace, labelselector)
+	go emitMetrics(ctx, ticker)
+	http.HandleFunc("/pods", getPodsHandler)
+	http.Handle("/metrics", promhttp.Handler())
+	http.HandleFunc("/errors", errorHandler)
+	http.HandleFunc("/data", postDataHandler)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func getDaemonSetFromKubeAPIServer(clientset *kubernetes.Clientset, namespace, labelselector string) {
+	for {
+		var err error
+		var pods *v1.PodList
+		var nodes *v1.NodeList
+		nodes, err = clientset.CoreV1().Nodes().List(metav1.ListOptions{})
+		if err != nil {
+			log.Printf("ERROR Not able to reach to Kubernetes Api Server to fetch node info %v", err)
+			exposePrometheusMetrics(false, errKubeAPIUnReachable)
+			time.Sleep(60 * time.Second)
+			continue
+		}
+
+		pods, err = clientset.CoreV1().Pods(namespace).List(metav1.ListOptions{LabelSelector: labelselector})
+		if err != nil {
+			log.Printf("ERROR Not able to reach to Kubernetes Api Server to fetch pod info %v", err)
+			exposePrometheusMetrics(false, errKubeAPIUnReachable)
+			time.Sleep(60 * time.Second)
+			continue
+		}
+		log.Printf("INFO Successfuly connected to Kube Api server and fetched Pods info and total pods are %v", len(pods.Items))
+
+		tempDaemonSetPodsData, err := storeDaemonSetPodsData(pods, nodes)
+		daemonSetPodsDataLock.Lock()
+		daemonSetPodsData = tempDaemonSetPodsData
+		daemonSetPodsDataLock.Unlock()
+		if err != nil {
+			exposePrometheusMetrics(false, err)
+			log.Printf("ERROR Got error from storeDaemonSetPodsData there was no data retrieved %v", err)
+			time.Sleep(60 * time.Second)
+			continue
+		}
+		exposePrometheusMetrics(true, err)
+		time.Sleep(180 * time.Second)
+	}
+}
+
+func storeDaemonSetPodsData(pods *v1.PodList, nodes *v1.NodeList) (map[string]string, error) {
+	tempDaemonSetPodsData := make(map[string]string)
+	if pods == nil || len(pods.Items) == 0 {
+		return daemonSetPodsData, errMissingPods
+	}
+	if nodes == nil || len(nodes.Items) == 0 {
+		return daemonSetPodsData, errMissingNodes
+	}
+
+	daemonSetNodesData := make(map[string]string)
+	for _, node := range nodes.Items {
+		val, exists := node.ObjectMeta.Annotations["cni-monitoring-disabled"]
+		if exists {
+			log.Printf("INFO %v has cni-monitoring-disabled annotation set %v", node.Name, val)
+			cniClientNetWorkingUP.With(prometheus.Labels{"hostname": node.Name}).Set(1)
+			continue
+		}
+		for _, nc := range node.Status.Conditions {
+			if nc.Type == v1.NodeReady {
+				if nc.Status == v1.ConditionTrue {
+					daemonSetNodesData[node.Name] = "Ready"
+				} else {
+					cniClientNetWorkingUP.With(prometheus.Labels{"hostname": node.Name}).Set(1)
+				}
+				break
+			}
+		}
+	}
+
+	for _, pod := range pods.Items {
+		_, exists := daemonSetNodesData[pod.Spec.NodeName]
+		if exists {
+			tempDaemonSetPodsData[pod.Status.PodIP] = pod.Spec.NodeName
+		}
+	}
+	return tempDaemonSetPodsData, nil
+}
+
+func getPodsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	daemonSetPodsDataLock.Lock()
+	jsonBytes, err := json.Marshal(daemonSetPodsData)
+	daemonSetPodsDataLock.Unlock()
+	if err != nil {
+		log.Printf("ERROR unable to marshall %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+	} else {
+		w.Write(jsonBytes)
+	}
+}
+
+func postDataHandler(w http.ResponseWriter, r *http.Request) {
+	// log.Printf("GOT REQUEST: %v", r)
+	if r.Method != "POST" {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("ERROR reading body %v : %v", err, r)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	var data utils.Status
+	err = json.Unmarshal(body, &data)
+	if err != nil {
+		log.Printf("ERROR unmarshalling body %v : %v", err, body)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	//decoder := json.NewDecoder(r.Body)
+	//var data utils.Status
+	//err := decoder.Decode(&data)
+	if data.PodIp == "" {
+		log.Printf("ERROR pod ip is empty %v", data)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	aggregatedClientDataLock.Lock()
+	aggregatedClientData[data.PodIp] = data
+	aggregatedClientDataLock.Unlock()
+	//w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode("OK")
+}
+
+func errorHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(aggregatedClientData)
+	w.WriteHeader(http.StatusOK)
+}
+
+// daemonSetPodsData : podip: nodes that are ready and doesnot have cni monitoring disabled flag
+// aggregatedClientData : podip: nodestatus
+// 1. set status of not ready nodes and nodes that have cni monitoring disabled flag to 1
+// 1. find nodes that are in daemonSetPodsData and not in aggregatedClientData
+//      This imples the pods running in ready nodes are not able to reach web server.
+//        set the status of those nodes to 1.
+// 2. pod running on ready node has nodestatus.OK false
+//      This implies that the pod was not able to download pod info from webserver or
+//      pod connectivity with other pods in daemonset failed.
+//
+func emitMetrics(ctx context.Context, ticker *time.Ticker) {
+	for {
+		select {
+		case <-ticker.C:
+			brokenNodesData := verifyClientDataAndSendMetrics()
+			for result := range brokenNodesData {
+				log.Printf("ERROR , Pod on Nodes %v are not able to talk to pod on Node %v", brokenNodesData[result], result)
+			}
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func verifyClientDataAndSendMetrics() map[string][]string {
+	daemonSetPodsDataLock.Lock()
+	aggregatedClientDataLock.Lock()
+	defer daemonSetPodsDataLock.Unlock()
+	defer aggregatedClientDataLock.Unlock()
+	multipleBrokenNodesData := make(map[string][]string)
+	for podIP, hostName := range daemonSetPodsData {
+		val, exists := aggregatedClientData[podIP]
+		if !exists {
+			log.Printf("ERROR The host %v could not reach cni monitoring web server pod", hostName)
+			cniClientNetWorkingUP.With(prometheus.Labels{"hostname": hostName}).Set(0)
+		} else {
+			if val.Ok {
+				cniClientNetWorkingUP.With(prometheus.Labels{"hostname": hostName}).Set(1)
+			} else {
+				for host := range val.ErrorDetails {
+					if value, ok := multipleBrokenNodesData[host]; ok {
+						value = append(value, hostName)
+						multipleBrokenNodesData[host] = value
+					} else {
+						multipleBrokenNodesData[host] = []string{hostName}
+					}
+				}
+				cniClientNetWorkingUP.With(prometheus.Labels{"hostname": hostName}).Set(0)
+			}
+		}
+	}
+	aggregatedClientData = make(map[string]utils.Status)
+	return multipleBrokenNodesData
+}
+
+func exposePrometheusMetrics(working bool, err error) {
+	if working {
+		cniWebServerNetWorking.With(prometheus.Labels{"errMsg": ""}).Set(1)
+		cniWebServerNetWorkingUP.Set(1)
+	} else {
+		cniWebServerNetWorking.With(prometheus.Labels{"errMsg": err.Error()}).Set(0)
+		cniWebServerNetWorkingUP.Set(0)
+	}
+}
