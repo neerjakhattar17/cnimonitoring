@@ -1,0 +1,158 @@
+package main
+
+import (
+	"fmt"
+	"github.com/stretchr/testify/assert"
+	"github.pan.local/kubernetes/cni-monitoring/utils"
+	"io/ioutil"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"log"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestStoreDaemonSetPodsData(t *testing.T) {
+	podList := getPodList()
+	nodeList := getNodeList()
+	output, err := storeDaemonSetPodsData(podList, nodeList)
+	if err != nil {
+		t.Error("unexpected error")
+	}
+	if len(output) != 3 {
+		t.Error("unexpected error")
+	}
+	fmt.Printf("%v", output)
+}
+
+func TestVerifyClientDataAndSendMetrics(t *testing.T) {
+
+	daemonSetPodsData = map[string]string{"10.100.42.1": "host1.pan.local", "10.100.42.2": "host2.pan.local", "10.100.42.3": "host3.pan.local"}
+	aggregatedClientData = map[string]utils.Status{
+		"10.100.42.1": utils.Status{
+			Ok: false,
+			ErrorDetails: map[string]string{
+				"host3.pan.local": "error io timeout",
+			},
+		},
+		"10.100.42.2": utils.Status{
+			Ok: false,
+			ErrorDetails: map[string]string{
+				"host3.pan.local": "error io timeout",
+			},
+		},
+		"10.100.42.3": utils.Status{
+			Ok:           true,
+			ErrorDetails: map[string]string{},
+		},
+	}
+	result := verifyClientDataAndSendMetrics()
+	val, ok := result["host3.pan.local"]
+	assert.Equal(t, ok, true)
+	assert.Equal(t, len(val), 2)
+	assert.Equal(t, contains(val, "host1.pan.local"), true)
+	assert.Equal(t, contains(val, "host2.pan.local"), true)
+
+}
+func getPodList() *v1.PodList {
+	pods := []v1.Pod{}
+	for i := 0; i < 5; i++ {
+		newPod := v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("cni_mon_client_%d", i),
+			},
+			Status: v1.PodStatus{PodIP: fmt.Sprintf("127.0.0.%d", i)},
+			Spec:   v1.PodSpec{NodeName: fmt.Sprintf("host%d.ap.pan.local", i)},
+		}
+		pods = append(pods, newPod)
+	}
+	return &v1.PodList{
+		Items: pods,
+	}
+}
+
+func getNodeList() *v1.NodeList {
+	nodes := []v1.Node{}
+	for i := 0; i < 3; i++ {
+		newNode := v1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("host%d.ap.pan.local", i),
+			},
+			Status: v1.NodeStatus{
+				Conditions: []v1.NodeCondition{
+					v1.NodeCondition{
+						Type:   v1.NodeReady,
+						Status: v1.ConditionTrue,
+					},
+				},
+			},
+		}
+		nodes = append(nodes, newNode)
+	}
+	newNode := v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "host4.ap.pan.local", Annotations: map[string]string{"cni-monitoring-disabled": "true"}},
+	}
+	nodes = append(nodes, newNode)
+	return &v1.NodeList{
+		Items: nodes,
+	}
+}
+
+func TestStoreDaemonSetPodsEmptyData(t *testing.T) {
+	var pods = &v1.PodList{
+		Items: []v1.Pod{},
+	}
+	_, err := storeDaemonSetPodsData(pods, nil)
+	assert.Equal(t, errMissingPods, err)
+}
+
+func TestStoreDaemonSetPodsNil(t *testing.T) {
+	_, err := storeDaemonSetPodsData(nil, nil)
+	assert.Equal(t, errMissingPods, err)
+}
+
+func TestStoreDaemonSetNodesEmptyData(t *testing.T) {
+	_, err := storeDaemonSetPodsData(getPodList(), nil)
+	assert.Equal(t, errMissingNodes, err)
+}
+
+func TestStoreDaemonSetNodesNil(t *testing.T) {
+	_, err := storeDaemonSetPodsData(getPodList(), nil)
+	assert.Equal(t, errMissingNodes, err)
+}
+
+func TestHandler(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(getPodsHandler))
+	defer ts.Close()
+	data := `{"127.0.0.1":"testpod"}`
+	daemonSetPodsData = map[string]string{
+		"127.0.0.1": "testpod",
+	}
+
+	response, err := http.Get(ts.URL)
+	if err != nil {
+		t.Error("unexpected error")
+	}
+	defer response.Body.Close()
+	responseData, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if string(responseData) != data {
+		t.Error("Got unexpected response")
+	}
+
+	if response.Header["Content-Type"][0] != "application/json" {
+		t.Error("Unexpected content type header")
+	}
+}
+
+func contains(s []string, e string) bool {
+	for _, a := range s {
+		if a == e {
+			return true
+		}
+	}
+	return false
+}
