@@ -1,0 +1,21 @@
+package utils
+
+import (
+	"os"
+)
+
+type Status struct {
+	Ok           bool
+	Message      string
+	Host         string
+	PodIp        string
+	ErrorDetails map[string]string
+}
+
+func GetEnv(key, defaultval string) string {
+	value, exists := os.LookupEnv(key)
+	if !exists {
+		return defaultval
+	}
+	return value
+}
