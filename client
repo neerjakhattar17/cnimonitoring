@@ -1,0 +1,183 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"github.pan.local/kubernetes/cni-monitoring/utils"
+)
+
+var (
+	myhostname              = os.Getenv("MY_HOST_NAME")
+	myPodIP                 = os.Getenv("MY_POD_IP")
+	errServerUnreachable    = errors.New("cni-mon-webserver-unreachable")
+	errNoData               = errors.New("cni-mon-webserver-returned-no-data")
+	errBadData              = errors.New("cni-mon-webserver-returned-bad-data")
+	errClientPodUnreachable = errors.New("client-pods-unreachable")
+	errInvalidURL           = errors.New("invalid-url")
+	finalError              error
+	badHostsData            string
+)
+
+const noPodData = "NoPodDataYet"
+
+func main() {
+	webserverurl := utils.GetEnv("CNI_MON_WEBSERVER_URL", "http://cni-mon-webserver.kube-system.svc.cluster.local:8080")
+	go longRunningDameonSetFetcherProcess(webserverurl)
+	log.Println("Starting the application...")
+	http.HandleFunc("/", clientHandler)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func clientHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode("I am alive")
+}
+
+func longRunningDameonSetFetcherProcess(webserverurl string) {
+
+	for {
+		time.Sleep(180 * time.Second)
+		// web service service with namespace
+		var statusData utils.Status
+		data, err := getDaemonSetFromWebServer(webserverurl + "/pods")
+		if err != nil {
+			log.Printf("ERROR The HTTP request failed with error %v\n", err)
+			message := "Failed to get Daemonset from cni mon web server"
+			statusData = getStatusData(false, message, myhostname, myPodIP, nil)
+		} else {
+			errorStatuses, err := validatePodConnectivityWithAnotherPod(data, 8080)
+			if err != nil {
+				log.Printf("ERROR Pod to Pod Connectivity is broken %v", err)
+				message := "ERROR Pod to Pod Connectivity is broken" + err.Error()
+				statusData = getStatusData(false, message, myhostname, myPodIP, errorStatuses)
+			} else {
+				statusData = getStatusData(true, "Working", myhostname, myPodIP, nil)
+			}
+		}
+		postStatusData(webserverurl+"/data", statusData)
+	}
+}
+
+func postStatusData(webserverurl string, statusData utils.Status) error {
+
+	bytesRepresentation, err := json.Marshal(statusData)
+	if err != nil {
+		log.Printf(err.Error())
+		os.Exit(2)
+	}
+	//log.Printf("Json data %v", string(bytesRepresentation))
+	req, err := http.NewRequest("POST", webserverurl, bytes.NewBuffer(bytesRepresentation))
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Not able to Post Data to CNI web Server %v", webserverurl)
+	} else {
+		log.Printf("response Status: %v", resp.Status)
+		log.Printf("response Headers: %v", resp.Header)
+		defer resp.Body.Close()
+	}
+	return err
+}
+
+func getStatusData(Ok bool, message, myhostname, myPodIP string, errorStatuses map[string]string) utils.Status {
+	return utils.Status{
+		Ok:           Ok,
+		Message:      message,
+		Host:         myhostname,
+		PodIp:        myPodIP,
+		ErrorDetails: errorStatuses,
+	}
+}
+
+func getDaemonSetFromWebServer(webserverurl string) (string, error) {
+	var err error
+	var response *http.Response
+	response, err = http.Get(webserverurl)
+	if err != nil {
+		return noPodData, errServerUnreachable
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 {
+		return noPodData, errServerUnreachable
+	}
+	data, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return noPodData, errNoData
+
+	}
+	return string(data), nil
+}
+
+func validatePodConnectivityWithAnotherPod(data string, clientPort int) (map[string]string, error) {
+	var err error
+	var res map[string]string
+	var errstrings []string
+	errorStatuses := make(map[string]string)
+	if err = json.Unmarshal([]byte(data), &res); err != nil {
+		return errorStatuses, errBadData
+	}
+	_, exists := res[myPodIP]
+	if !exists {
+		log.Printf("Either the %s host have annonation set with cni-monitoring-disabled=True or it is in NotReady State", myhostname)
+		return errorStatuses, nil
+	}
+	for podIP, podHostName := range res {
+		err = podToPodConnectivity(podHostName, podIP, clientPort)
+		if err != nil {
+			err_string := fmt.Sprintf("ERROR Connectivity from %v to %v is broken due to:   %v", myhostname, podHostName, err.Error())
+			errorStatuses[podIP+"/"+podHostName] = err_string
+
+			errstrings = append(errstrings, err_string)
+		}
+	}
+	if len(errstrings) == 0 {
+		log.Printf("The pod on %s is able to connect to all other pods in the cni daemonset", myhostname)
+		return errorStatuses, nil
+	}
+	finalError = errors.New(strings.Join(errstrings, "\n"))
+	return errorStatuses, finalError
+}
+
+func podToPodConnectivity(podHostName, podIP string, clientPort int) error {
+	var err error
+	var response *http.Response
+
+	log.Printf("%v Accessing %v at %v", time.Now(), podHostName, podIP)
+	podIPUrl := fmt.Sprintf("http://%s:%d/", podIP, clientPort)
+	log.Printf("The client url is http://%s:%d/", podIP, clientPort)
+	_, err = url.Parse(podIPUrl)
+	if err != nil {
+		log.Printf("ERROR Invalid URL %s failed\n", podIPUrl)
+		return errInvalidURL
+	}
+	if podIP == "" {
+		log.Printf("ERROR Got empty podIP %v:%v\n", podHostName, podIP)
+		return errors.New("Got empty podIP")
+	}
+
+	response, err = http.Get(podIPUrl)
+	if err != nil {
+		log.Printf("ERROR Access %s %s failed %v\n", podHostName, podIP, err)
+		return err
+	}
+	if response.StatusCode != 200 {
+		log.Printf("ERROR Access %s %s got HTTP Code %v\n", podHostName, podIP, response.StatusCode)
+		return errors.New("Got non 200 response code ")
+	}
+
+	log.Printf("Access %s succeeded\n", podHostName)
+	defer response.Body.Close()
+	return nil
+}
