@@ -1,0 +1,109 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.pan.local/kubernetes/cni-monitoring/utils"
+)
+
+var (
+	data = `{"127.0.0.1":"pod-test"}`
+)
+
+func TestGetDaemonSetFromWebServerOK(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, data)
+	}))
+
+	defer ts.Close()
+	ret, err := getDaemonSetFromWebServer(ts.URL)
+	assert.Nil(t, err)
+	assert.Equal(t, data, strings.TrimSpace(ret))
+
+}
+
+func TestGetDaemonSetFromWebServerError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+
+	defer ts.Close()
+	_, err := getDaemonSetFromWebServer(ts.URL)
+	assert.Equal(t, errServerUnreachable, err)
+}
+
+func TestPostData(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("ERROR reading body %v : %v", err, r)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		log.Printf("Body %v %+v", string(body), r)
+		var data utils.Status
+		err = json.Unmarshal(body, &data)
+		if err != nil {
+			log.Printf("ERROR unmarshalling body %v : %v", err, body)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		log.Printf("dddddd %v", data)
+	}))
+
+	defer ts.Close()
+	data := utils.Status{
+		Ok:           true,
+		Message:      "working",
+		Host:         "127.0.0.1",
+		PodIp:        "10.10.10.10",
+		ErrorDetails: nil,
+	}
+
+	err := postStatusData(ts.URL, data)
+	log.Printf("%v", err)
+}
+
+func TestGetDaemonSetFromWebServerErrorWithNoData(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "")
+	}))
+
+	defer ts.Close()
+	ret, _ := getDaemonSetFromWebServer(ts.URL)
+	assert.Equal(t, "", strings.TrimSpace(ret))
+}
+
+func TestValidatePodConnectivityWithAnotherPodOk(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, data)
+	}))
+	defer ts.Close()
+	_, err := validatePodConnectivityWithAnotherPod(data, ts.Listener.Addr().(*net.TCPAddr).Port)
+	assert.Nil(t, err)
+}
+
+func TestValidatePodConnectivityWithAnotherPodJsonError(t *testing.T) {
+	_, err := validatePodConnectivityWithAnotherPod("{invalid-json{", 8080)
+	assert.Equal(t, errBadData, err)
+}
+
+func TestValidatePodConnectivityWithAnotherPodNotOK(t *testing.T) {
+	_, err := validatePodConnectivityWithAnotherPod(data, 8080)
+	assert.Equal(t, finalError, err)
+}
+
+func TestValidatePodConnectivityWithNoData(t *testing.T) {
+
+	_, err := validatePodConnectivityWithAnotherPod("", 8080)
+	assert.Equal(t, errBadData, err)
+}
