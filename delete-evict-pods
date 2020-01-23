@@ -1,0 +1,62 @@
+package main
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"log"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+)
+
+func main() {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	log.Println("Successfuly fetched kube config")
+	fetchDeleteEvictedPodsFromKubeAPIServer(clientset)
+}
+
+func fetchDeleteEvictedPodsFromKubeAPIServer(clientset kubernetes.Interface) int {
+	var err error
+	var pods *v1.PodList
+	var count int
+	var cont string
+	for i := 0; i < 10; i++ {
+		pods, err = clientset.CoreV1().Pods("").List(metav1.ListOptions{Limit: 1000, Continue: cont})
+		if err != nil {
+			log.Printf("ERROR Not able to reach to Kubernetes Api Server to fetch pod info %v", err)
+			return count
+		}
+		log.Printf("Successfuly connected to Kube Api server and fetched Pods info and total pods are %v", len(pods.Items))
+
+		var grace int64 = 0
+		for _, pod := range pods.Items {
+			if pod.Status.StartTime == nil {
+				continue
+			}
+			elapsed := time.Now().Sub(pod.Status.StartTime.Time)
+			if elapsed.Hours() > 4 && pod.Status.Reason == "Evicted" {
+				err := clientset.CoreV1().Pods(pod.ObjectMeta.Namespace).Delete(pod.Name, &metav1.DeleteOptions{GracePeriodSeconds: &grace})
+				log.Printf("Deleting Pod %v %v", pod.Name, pod.Status.Reason)
+				if err != nil {
+					log.Printf("ERROR Not able to pod %v", err)
+				} else {
+					count++
+				}
+			}
+
+		}
+		if pods.ListMeta.Continue == "" {
+			return count
+		}
+		cont = pods.ListMeta.Continue
+	}
+	return count
+}
